@@ -1,4 +1,4 @@
-# OpenX-1
+# OpenX v1.2
 OpenX is a 3D rendering engine for Python developed using PyGame and pyOpenGL. It is intended to make developing 3D scenes using Python and OpenGL easier and more intutive. This code is very primitive and renders PS1/N64 level 3D graphics. Feel free to change OpenX to fit your needs.
 
 Official documentation is at https://mjwil116.codehs.me/openx.html/.
