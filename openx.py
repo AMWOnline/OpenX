@@ -1,4 +1,4 @@
-# Open-X Version 1.2
+# Open-X Version 1.3
 # Developed by Madden Wilkins
 # www.mjwil116.codehs.me/openx.html
 
@@ -14,6 +14,8 @@ import random
 import math
 import numpy as np
 from PIL import Image
+
+import re
 
 pygame.font.init()
 
@@ -47,11 +49,6 @@ def init():
     
     glMatrixMode(GL_MODELVIEW)
 
-    glDisable(GL_DITHER)
-    glDisable(GL_POINT_SMOOTH)
-    glDisable(GL_LINE_SMOOTH)
-    glDisable(GL_POLYGON_SMOOTH)
-
     glLight(GL_LIGHT0, GL_POSITION,  (5, 5, 5, 1))
     glLightfv(GL_LIGHT0, GL_AMBIENT, (1, 1, 1, 1))
     glLightfv(GL_LIGHT0, GL_DIFFUSE, (1, 1, 1, 1))
@@ -84,8 +81,8 @@ def load_texture(filepath):
     img_data = np.array(list(img.getdata()), np.uint8)
     texture_id = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, texture_id)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.width, img.height, 0, GL_RGB, GL_UNSIGNED_BYTE, img_data)
     #glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
     glBindTexture(GL_TEXTURE_2D, 0)
@@ -810,9 +807,11 @@ class Geometry:
             self.pos_z += z
 
         # Transform the object by stretching or shrinking its length, width and/or height.
-        def transform(self, r):
+        def transform(self, b, t, h):
             
-            self *= r
+            self.bottom_radius *= b
+            self.top_radius *= t
+            self.height *= h
 
         
         # Render object to screen.
@@ -877,3 +876,128 @@ class Font:
         textData = pygame.image.tostring(textSurface, "RGBA", True)
         glWindowPos2d(x, y)
         glDrawPixels(textSurface.get_width(), textSurface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, textData)
+
+'''
+
+XObject Class
+Allows for the use of custom 3D models made using the '.xobj' file format
+
+'''
+        
+class XObject:
+    
+    # Creates a new XObject with xobj file at path fp with position x, y, z and transform of l, w, h
+    def __init__(self, fp, x, y, z, l, w, h):
+        
+        self.pos_x = x
+        self.pos_y = y
+        self.pos_z = z
+        self.length = l
+        self.width = w
+        self.height = h
+        self.filepath = fp
+    
+        self.VERTICIES = []
+        self.FACES = []
+        
+        self.texture = "tex_missing.png"
+        self.tiles = 1
+        
+        with open(os.getcwd() + "/" + self.filepath, "r") as file:
+            lines = [line.rstrip() for line in file]
+            
+            for line in lines:
+                
+                if line[0] == "v":
+                    
+                    
+                    l = []
+        
+                    for t in line.split():
+                        
+                        try:
+                            l.append(float(t))
+                            
+                        except ValueError:
+                            pass
+                        
+                        
+                    self.VERTICIES.append(l)
+                    
+                if line[0] == "f":
+                    
+                    
+                    l = []
+        
+                    for t in line.split():
+                        
+                        try:
+                            l.append(int(t))
+                            
+                        except ValueError:
+                            pass
+                        
+                        
+                    self.FACES.append(l)
+                        
+    # Move / translate the object by moving it in the x,y,z coordinate plane.
+    def translate(self, x, y, z):
+            
+        self.pos_x += x
+        self.pos_y += y
+        self.pos_z += z
+        
+    # Renders the XObject in the scene
+    def draw(self):
+        
+        texture_id = load_texture(self.texture)
+            
+        glEnable(GL_TEXTURE_2D)
+        glEnable(GL_DEPTH_TEST)
+            
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
+            
+        glBindTexture(GL_TEXTURE_2D, texture_id)
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE )
+            
+        lights_on()
+            
+        glBegin(GL_QUADS)
+        
+        for i in range(len(self.FACES)):
+            XObject._draw_face(self, self.FACES[i])
+  
+        glEnd()
+
+        lights_off()
+            
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glDisable(GL_TEXTURE_2D)
+        
+        
+    def _draw_face(self, vertlist):
+        
+        #print(vertlist)
+
+        glTexCoord2f(0,0)
+        glVertex3fv(self.VERTICIES[vertlist[0] - 1])
+
+        glTexCoord2f(0,self.tiles)
+        glVertex3fv(self.VERTICIES[vertlist[1] - 1])
+
+        glTexCoord2f(self.tiles,self.tiles)
+        glVertex3fv(self.VERTICIES[vertlist[2] - 1])
+        
+        try:
+            glTexCoord2f(self.tiles,0)
+            glVertex3fv(self.VERTICIES[vertlist[3] - 1])
+        except:
+            glTexCoord2f(self.tiles,0)
+            glVertex3fv(self.VERTICIES[vertlist[0] - 1])
+        
+        
+    # Applies a new texture to the object (with tiling factor).
+    def apply_texture(self, fp, tiling):
+            
+        self.texture = fp
+        self.tiles = tiling
