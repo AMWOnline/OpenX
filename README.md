@@ -3,4 +3,4 @@ OpenX is a 3D rendering engine for Python developed using PyGame and pyOpenGL. I
 
 Official documentation is at https://mjwil116.codehs.me/openx.html/.
 
-<img src="blob:chrome-untrusted://media-app/dc873266-9cf5-44f9-a967-8a8d2ffa5f74"/><img width="452" height="339" alt="image" src="https://github.com/user-attachments/assets/c78fe5ec-38cd-43a5-90db-b3572b81c200" />
+<img width="903" height="678" alt="Demo screenshot of a bouncing ball rendered with OpenX v1.3" src="https://github.com/user-attachments/assets/7cd3722b-6c54-4e71-9159-678607e2d0bb" />
