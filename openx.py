@@ -1,6 +1,33 @@
-# Open-X Version 1.3
+# Open-X Version 1.4 - Optimized Build
 # Developed by Madden Wilkins
-# www.mjwil116.codehs.me/openx.html
+
+# Billboard draw() no longer re-uploads texture every frame
+# Polygon rotate() uses numpy matrix math instead of per-vertex Python loops
+# Quadric objects (Sphere, Cylinder, Disk) cache their GLU quadric handle
+# flip(): removed pygame.time.wait(10) - main source of FPS drops
+# lights_on/off() consolidated, redundant state calls removed
+# Font.draw_rgba() caches rendered surfaces by (text, font, size, color)
+#  Added Font.draw() which has a transparent background
+#  Added Font.draw_dynamic(), same as draw() but doesn't cache the text (useful for fast changing information to not overload the cache and use up resources)
+# Ceiling/Floor draw() removes dead tcoords/surfs variables and an extra vertex
+# _rotate_vertices() shared helper function now replaces duplicated rotate() in every Geometry class
+# Added transparent billboard support
+# Changed billboards to utilize quad rendering, allowing for accurate proportions
+# Got rid of coord_to_scale(), was obsolete
+# Changed resolution to a scalable 1600 * 1200 on PC
+# Added Audio class
+# Added CodeHS Mode: limits resolution to 360 * 240, upscaled 3 times; and disables audio support
+# Changed Controller class to just return pressed keyboard keys as a list
+# Changed Controller class to allow for mouse based rotation
+# Changed Controller class to have new mode() function
+# Added Mipmaps
+# Changed how textures are rendered to improve performance
+# Textures can now be HD
+# Overhauled Camera Class
+# Added new rotate() to all Geometry
+# Added more vertices spheres and cylinders
+# Added hitbox system
+# Added new Debug class
 
 import pygame
 from pygame.locals import *
@@ -12,992 +39,1209 @@ import os
 import time
 import random
 import math
+import psutil
 import numpy as np
 from PIL import Image
+
 
 import re
 
 pygame.font.init()
 
+CLOCK = pygame.time.Clock()
+
 # Global constants
 
-CAMERA_POS = [0, 0, -6.5]
-CAMERA_ROT = [0, 0, 0, 0]
-FOG_COLOR = [0, 0, 0]
-CEIL_TEX = "tex_missing.png"
-FLOOR_TEX = "tex_missing.png"
+CAMERA_POS   = [0, 0, 0]
+CAMERA_YAW   = 0.0
+CAMERA_PITCH = 0.0
+CAMERA_ROLL  = 0.0
 
-# Initialize OpenGL and Pygame
+FOG_COLOR    = [0, 0, 0]
+CEIL_TEX     = "tex_missing.png"
+FLOOR_TEX    = "tex_missing.png"
+TEXTURE_CACHE = {}
+FONT_CACHE    = {}   # (text, fp, size, color, bg_color) -> (w, h, bytes)
+WORLD_HITBOXES = []
+
+# Render resolution
+RENDER_WIDTH  = 1600
+RENDER_HEIGHT = 1200
+WINDOW_SCALE  = 1
+
+# FBO handles
+FBO         = None
+FBO_TEXTURE = None
+FBO_RBO     = None
+
+'''
+Helper functions
+'''
+def _rotate_vertices(vertices, ax, ay, az):
+    """Rotate a list of [x,y,z] vertices in-place around their centroid."""
+    if ax == 0 and ay == 0 and az == 0:
+        return
+
+    arr = np.array(vertices, dtype=np.float64)
+    center = arr.mean(axis=0)
+    arr -= center
+
+    if ax != 0:
+        rx = math.radians(ax)
+        cx, sx = math.cos(rx), math.sin(rx)
+        Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]])
+        arr = arr @ Rx.T
+
+    if ay != 0:
+        ry = math.radians(ay)
+        cy, sy = math.cos(ry), math.sin(ry)
+        Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])
+        arr = arr @ Ry.T
+
+    if az != 0:
+        rz = math.radians(az)
+        cz, sz = math.cos(rz), math.sin(rz)
+        Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]])
+        arr = arr @ Rz.T
+
+    arr += center
+
+    for i, v in enumerate(vertices):
+        v[0], v[1], v[2] = arr[i]
+
+'''
+init() function
+Sets up OpenX for use
+'''
 
 def init():
+    global FBO, FBO_TEXTURE, FBO_RBO
+    global GPU
 
     pygame.init()
 
+
+
     print("\n"*256)
-    print("This application is being emulated in OpenX (v1.2).\n")
-    print("Controls:")
-    print("[Z] - A")
-    print("[X] - B")
-    print("[ARROWS/WASD] - D-Pad\n")
-    print("Some programs may require the use of the mouse to simulate analog movement.\n")
+    print("This application is being emulated in OpenX v1.4")
     print("www.mjwil116.codehs.me/openx.html")
 
-    display = (800, 600)
-    screen = pygame.display.set_mode(display, DOUBLEBUF|OPENGL)
+    try:
+        pygame.mixer.init()
+    except:
+        print("Open-X [WARNING] >> Unable to load audio device!")
+
+    
+    try:
+        GPU = GPUtil.getGPUs()[0].name
+    except:
+        GPU = "No GPU"
+        print("Open-X [WARNING] >> No GPU is installed, or was detected!")
+        
+
+    win_w = RENDER_WIDTH  * WINDOW_SCALE
+    win_h = RENDER_HEIGHT * WINDOW_SCALE
+    pygame.display.set_mode((win_w, win_h), DOUBLEBUF | OPENGL)
+
+    FBO = glGenFramebuffers(1)
+    glBindFramebuffer(GL_FRAMEBUFFER, FBO)
+
+    FBO_TEXTURE = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, FBO_TEXTURE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, RENDER_WIDTH, RENDER_HEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, None)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, FBO_TEXTURE, 0)
+
+    FBO_RBO = glGenRenderbuffers(1)
+    glBindRenderbuffer(GL_RENDERBUFFER, FBO_RBO)
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT,RENDER_WIDTH, RENDER_HEIGHT)
+    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, FBO_RBO)
+
+    glBindFramebuffer(GL_FRAMEBUFFER, FBO)
+    glViewport(0, 0, RENDER_WIDTH, RENDER_HEIGHT)
+
     glMatrixMode(GL_PROJECTION)
     gluPerspective(45, (4/3), 0.1, 100.0)
-    
     glMatrixMode(GL_MODELVIEW)
 
-    glLight(GL_LIGHT0, GL_POSITION,  (5, 5, 5, 1))
+    glLight(GL_LIGHT0, GL_POSITION, (5, 5, 5, 1))
     glLightfv(GL_LIGHT0, GL_AMBIENT, (1, 1, 1, 1))
     glLightfv(GL_LIGHT0, GL_DIFFUSE, (1, 1, 1, 1))
-    
+
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
 
-    glTranslatef(CAMERA_POS[0], CAMERA_POS[1], CAMERA_POS[2])
-
-# Refresh the screen
-
+'''
+flip() function
+Refreshes the screen and advances to the next frame of video
+'''
 def flip():
+    CLOCK.tick(60)
 
-        pygame.display.flip()
-        pygame.time.wait(10)
+    win_w = RENDER_WIDTH  * WINDOW_SCALE
+    win_h = RENDER_HEIGHT * WINDOW_SCALE
 
-        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, FBO)
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
+    glBlitFramebuffer(
+        0, 0, RENDER_WIDTH, RENDER_HEIGHT,
+        0, 0, win_w, win_h,
+        GL_COLOR_BUFFER_BIT, GL_NEAREST
+    )
 
-        glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)
+    pygame.display.flip()
+    glBindFramebuffer(GL_FRAMEBUFFER, FBO)
+    glViewport(0, 0, RENDER_WIDTH, RENDER_HEIGHT)
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-# Returns an OpenGL Texture ID from a provided filepath
+    Camera.apply()
 
+'''
+General texture management
+'''
 def load_texture(filepath):
-            
+    global TEXTURE_CACHE
+
+    if filepath in TEXTURE_CACHE:
+        return TEXTURE_CACHE[filepath]
+
     try:
-        img = Image.open(filepath)
+        img = Image.open(filepath).convert("RGBA")
     except:
-        img = Image.open("tex_error.png")
+        img = Image.open("tex_error.png").convert("RGBA")
         print("Open-X [WARNING] >> Unable to load texture filepath '" + filepath + "'!")
-                
-    img_data = np.array(list(img.getdata()), np.uint8)
+
+    img_data   = np.array(img, np.uint8)
     texture_id = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, texture_id)
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.width, img.height, 0, GL_RGB, GL_UNSIGNED_BYTE, img_data)
-    #glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width, img.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                 img.width, img.height,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, img_data)
+    glGenerateMipmap(GL_TEXTURE_2D)
     glBindTexture(GL_TEXTURE_2D, 0)
+
+    TEXTURE_CACHE[filepath] = texture_id
     return texture_id
 
-# For billboard sprites; returns a pixel width/height based on the distance of the sprite to the camera
 
-def coord_to_scale(x, y, z, maximum):
+def unload_texture(filepath):
+    global TEXTURE_CACHE
+    if filepath in TEXTURE_CACHE:
+        glDeleteTextures(1, [TEXTURE_CACHE[filepath]])
+        del TEXTURE_CACHE[filepath]
 
-    distance = math.sqrt(((CAMERA_POS[0] - x)**2) + ((CAMERA_POS[1] - y)**2) + ((CAMERA_POS[2] - z)**2))
-
-    result = -(distance - maximum)
-    
-    if result < 0:
-
-        return 0
-
-    else:
-
-        return result
-
-# For loading and unloading lighting OpenGL methods
+'''
+Lighting functions
+'''
 
 def lights_on():
-
     glEnable(GL_LIGHTING)
     glEnable(GL_LIGHT0)
     glEnable(GL_COLOR_MATERIAL)
+    glShadeModel(GL_SMOOTH)
 
 def lights_off():
+    glDisable(GL_LIGHT0)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_COLOR_MATERIAL)
 
-        glDisable(GL_LIGHT0)
-        glDisable(GL_LIGHTING)
-        glDisable(GL_COLOR_MATERIAL)
-        
 '''
 Controller Class
-
-Methods to allow controller input (that conforms to the OpenX standard)
+Deals with handling input and different modes of controllers
 '''
 
 class Controller:
-    
-    # Returns a string of the button pressed. Ex: 'a' for when A is pressed and 'u/l/d/r' for arrow keys, etc.
-    
-    # Always returns single character strings
-    
-    def read():
-        
-        for event in pygame.event.get():
-                
-            if event.type == pygame.KEYDOWN:
-                
-                if pygame.key.name(event.key).upper() == "Z":
-                    
-                    return 'a'
-                    
-                if pygame.key.name(event.key).upper() == "X":
-                    
-                    return 'b'
-                    
-                if pygame.key.name(event.key).upper() == "UP":
-                    
-                    return 'u'
-                    
-                if pygame.key.name(event.key).upper() == 'DOWN':
-                    
-                    return 'd'
-                    
-                if pygame.key.name(event.key).upper() == 'LEFT':
-                    
-                    return 'l'
-                    
-                if pygame.key.name(event.key).upper() == 'RIGHT':
-                    
-                    return 'r'
 
+    _mouse_captured = False
+    _sensitivity    = 0.2
+    _mouse_look     = False
+    _mouse_look_no_y = False
+    _held_keys      = set()
+
+    def read():
+        for event in pygame.event.get():
+
+            if event.type == pygame.QUIT:
+                return {'QUIT'}
+
+            if event.type == pygame.KEYDOWN:
+                if Controller._mouse_look and event.key == pygame.K_ESCAPE:
+                    Controller._release_mouse()
+                Controller._held_keys.add(pygame.key.name(event.key).upper())
+
+            if event.type == pygame.KEYUP:
+                Controller._held_keys.discard(pygame.key.name(event.key).upper())
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                if Controller._mouse_look and not Controller._mouse_captured:
+                    Controller._capture_mouse()
+
+        if Controller._mouse_look and Controller._mouse_captured:
+            dx, dy = pygame.mouse.get_rel()
+            Camera.rotate(dx * Controller._sensitivity,
+                          dy * Controller._sensitivity)
+
+        if Controller._mouse_look_no_y and Controller._mouse_captured:
+            dx, dy = pygame.mouse.get_rel()
+            Camera.rotate(dx * Controller._sensitivity,
+                          0)
+
+        return set(Controller._held_keys)
+
+    def _enable_mouse_look(sensitivity=0.2):
+        Controller._sensitivity = sensitivity
+        Controller._mouse_look  = True
+        Controller._capture_mouse()
+
+    def _enable_mouse_look_no_y(sensitivity=0.2):
+        Controller._sensitivity = sensitivity
+        Controller._mouse_look_no_y  = True
+        Controller._capture_mouse()
+
+    def set_sensitivity(sensitivity):
+        Controller._sensitivity = sensitivity
+
+    def _capture_mouse():
+        pygame.mouse.set_visible(False)
+        pygame.event.set_grab(True)
+        pygame.mouse.get_rel()
+        Controller._mouse_captured = True
+
+    def _release_mouse():
+        pygame.mouse.set_visible(True)
+        pygame.event.set_grab(False)
+        Controller._mouse_captured = False
+
+    def mode(mode):
+        if mode == 1:
+            Controller._enable_mouse_look()
+        if mode == 2:
+            Controller._enable_mouse_look_no_y()
 
 '''
 Camera Class
-
-Methods to allow for the environment/camera to be manipulated to show different perspectives of the scene.
-
+Deals with different camera functions
 '''
 class Camera:
 
-    # Rotate the environment, with specific angle along roll (X), pitch (Y), and yaw (Z).
-    def rotate(angle, roll, pitch, yaw):
-        
-        global CAMERA_ROT
-        
-        CAMERA_ROT = [angle, roll, pitch, yaw]
-        
-        glRotatef(angle, roll, pitch, yaw)
-        
-    # Translate the entire environment by x, y, z units.   
-    def translate(x,y,z):
-        
+    def apply():
+        global CAMERA_POS, CAMERA_YAW, CAMERA_PITCH, CAMERA_ROLL
+        glLoadIdentity()
+        glRotatef(CAMERA_ROLL,  0, 0, 1)
+        glRotatef(CAMERA_PITCH, 1, 0, 0)
+        glRotatef(CAMERA_YAW,   0, 1, 0)
+        glTranslatef(-CAMERA_POS[0], -CAMERA_POS[1], -CAMERA_POS[2])
+
+    def translate(x, y, z):
+        global CAMERA_POS, CAMERA_YAW, CAMERA_PITCH
+
+        yaw_rad   = math.radians(CAMERA_YAW)
+        pitch_rad = math.radians(CAMERA_PITCH)
+
+        fwd_x =  math.sin(yaw_rad) * math.cos(pitch_rad)
+        fwd_y = -math.sin(pitch_rad)
+        fwd_z = -math.cos(yaw_rad) * math.cos(pitch_rad)
+
+        right_x = math.cos(yaw_rad)
+        right_y = 0
+        right_z = math.sin(yaw_rad)
+
+        CAMERA_POS[0] += fwd_x * z + right_x * x
+        CAMERA_POS[1] += fwd_y * z + right_y * x + y
+        CAMERA_POS[2] += fwd_z * z + right_z * x
+
+    def rotate(yaw, pitch, roll=0):
+        global CAMERA_YAW, CAMERA_PITCH, CAMERA_ROLL
+        CAMERA_YAW   = (CAMERA_YAW + yaw) % 360
+        CAMERA_PITCH = max(-89.0, min(89.0, CAMERA_PITCH + pitch))
+        CAMERA_ROLL  = (CAMERA_ROLL + roll) % 360
+
+    def set_pos(x, y, z):
         global CAMERA_POS
-        CAMERA_POS = [CAMERA_POS[0] + x, CAMERA_POS[1] + y, CAMERA_POS[2] + z]
-        glTranslatef(x,y,z)
-    
-    # Takes in a array of 3 elements, representing roll, pitch and yaw. If the rotation along one axis is above 360 deg, set it to 0 deg. Returns new array.
+        CAMERA_POS = [float(x), float(y), float(z)]
+
+    def set_rotation(yaw, pitch, roll=0):
+        global CAMERA_YAW, CAMERA_PITCH, CAMERA_ROLL
+        CAMERA_YAW   = float(yaw)   % 360
+        CAMERA_PITCH = max(-89.0, min(89.0, float(pitch)))
+        CAMERA_ROLL  = float(roll)  % 360
+
+    def get_rotation():
+        return [CAMERA_YAW, CAMERA_PITCH, CAMERA_ROLL]
+
+    def get_pos():
+        return CAMERA_POS[:]
+
     def cull_rotation(arr):
-        
-        result_arr_0 = arr[0]
-        result_arr_1 = arr[1]
-        result_arr_2 = arr[2]
-        
-        if arr[0] >= 361:
-            
-            result_arr_0 = 0
-            
-        if arr[1] >= 361:
-            
-            result_arr_1 = 0
-            
-        if arr[2] >= 361:
-            
-            result_arr_2 = 0
-            
-        return [result_arr_0, result_arr_1, result_arr_2]
-    
+        return [val % 360 for val in arr]
+
 '''
 Environment Class
-
-Methods for controlling the behavior and appearance of the scene environment; such as lighting, fog, ceiling and roof properties, etc.
-
+Deals with the overal scene and its attributes
 '''
-class Environment:
-    
-    # Set fog color of the environment in RGB
-    def set_fog_color(r, g, b):
 
+class Environment:
+
+    def set_fog_color(r, g, b):
         global FOG_COLOR
         FOG_COLOR = [(r/255), (g/255), (b/255)]
         glClearColor((r/255), (g/255), (b/255), 0)
-    
+
     class Ceiling:
-        
+
         def draw():
-
-            global CEIL_TEXT
-
-            tcoords = [
-                [0,1,1,0,0],
-                [0,0,1,1,0]
-                ]
-
             verts = [
-                [-128,0,128],
-                [128,0,128],
-                [128,0,-128],
-                [-128,0,-128]
-                ]
-            
-            surfs = [
-                [0,1,2,3]
-                ]
-            
-            texture_id = load_texture(CEIL_TEX)
+                [-128, 0,  128],
+                [ 128, 0,  128],
+                [ 128, 0, -128],
+                [-128, 0, -128],
+            ]
 
+            texture_id = load_texture(CEIL_TEX)
             glTranslatef(0, 6.5, 0)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
             glBindTexture(GL_TEXTURE_2D, texture_id)
             glBegin(GL_QUADS)
-
-            glTexCoord2f(0,0)
-            glVertex3fv(verts[0])
-
-            glTexCoord2f(32,0)
-            glVertex3fv(verts[1])
-
-            glTexCoord2f(32,32)
-            glVertex3fv(verts[2])
-
-            glTexCoord2f(0,32)
-            glVertex3fv(verts[3])
-
-            glTexCoord2f(0,0)
-            glVertex3fv(verts[0])
-                    
+            glTexCoord2f( 0,  0); glVertex3fv(verts[0])
+            glTexCoord2f(32,  0); glVertex3fv(verts[1])
+            glTexCoord2f(32, 32); glVertex3fv(verts[2])
+            glTexCoord2f( 0, 32); glVertex3fv(verts[3])
             glEnd()
-            
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
-
             glTranslatef(0, -6.5, 0)
 
         def apply_texture(filepath):
-
             global CEIL_TEX
             CEIL_TEX = filepath
 
     class Floor:
-        
+
         def draw():
-
-            global FLOOR_TEX
-
-            tcoords = [
-                [0,1,1,0,0],
-                [0,0,1,1,0]
-                ]
-
             verts = [
-                [-128,0,128],
-                [128,0,128],
-                [128,0,-128],
-                [-128,0,-128]
-                ]
-            
-            surfs = [
-                [0,1,2,3]
-                ]
-            
-            texture_id = load_texture(FLOOR_TEX)
+                [-128, 0,  128],
+                [ 128, 0,  128],
+                [ 128, 0, -128],
+                [-128, 0, -128],
+            ]
 
+            texture_id = load_texture(FLOOR_TEX)
             glTranslatef(0, -6.5, 0)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
             glBindTexture(GL_TEXTURE_2D, texture_id)
             glBegin(GL_QUADS)
-
-            glTexCoord2f(0,0)
-            glVertex3fv(verts[0])
-
-            glTexCoord2f(32,0)
-            glVertex3fv(verts[1])
-
-            glTexCoord2f(32,32)
-            glVertex3fv(verts[2])
-
-            glTexCoord2f(0,32)
-            glVertex3fv(verts[3])
-
-            glTexCoord2f(0,0)
-            glVertex3fv(verts[0])
-                    
+            glTexCoord2f( 0,  0); glVertex3fv(verts[0])
+            glTexCoord2f(32,  0); glVertex3fv(verts[1])
+            glTexCoord2f(32, 32); glVertex3fv(verts[2])
+            glTexCoord2f( 0, 32); glVertex3fv(verts[3])
             glEnd()
-            
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
-
             glTranslatef(0, 6.5, 0)
 
         def apply_texture(filepath):
-
             global FLOOR_TEX
             FLOOR_TEX = filepath
+
 '''
 Tex2D Class
-
-Methods dealing with actors with 2D properties like Billboards.
-
+Deals with texture handling and billboards
 '''
+
 class Tex2D:
 
     class Billboard:
 
-        # Creates a new billboard sprite object with at x, y, z, and texture filepath.
-        def __init__(self, x, y, z, filepath):
-
-            self.x = x
-            self.y = y
-            self.z = z
-            self.filepath = filepath
+        def __init__(self, x, y, z, width, height, filepath):
+            self.x          = x
+            self.y          = y
+            self.z          = z
+            self.width      = width
+            self.height     = height
+            self.filepath   = filepath
+            self.texture_id = load_texture(filepath)
 
         def draw(self):
+            # Use cached texture_id — no disk or GPU upload this frame
+            mv    = glGetFloatv(GL_MODELVIEW_MATRIX)
+            right = [mv[0][0], mv[1][0], mv[2][0]]
+            up    = [mv[0][1], mv[1][1], mv[2][1]]
 
-             # Load texture filepath to a pygame surface
-            
-            try:
+            hw = self.width  / 2.0
+            hh = self.height / 2.0
+            cx, cy, cz = self.x, self.y, self.z
 
-                img_load = pygame.image.load(self.filepath)
-                surface = pygame.transform.scale(img_load, (coord_to_scale(self.x, self.y, self.z, img_load.get_width()), coord_to_scale(self.x, self.y, self.z, img_load.get_height())))
-            
-            except:
-            
-                # If filepath is invalid or doesn't exist, load the error texture, and raise a warning
-                surface = pygame.image.load('tex_error.png')
-                print("Open-X [WARNING] >> Unable to load Tex2D (StaticBillboard) filepath '" + self.filepath + "'!")
+            v_bl = [cx + (-right[0]*hw) + (-up[0]*hh),
+                    cy + (-right[1]*hw) + (-up[1]*hh),
+                    cz + (-right[2]*hw) + (-up[2]*hh)]
+            v_br = [cx + ( right[0]*hw) + (-up[0]*hh),
+                    cy + ( right[1]*hw) + (-up[1]*hh),
+                    cz + ( right[2]*hw) + (-up[2]*hh)]
+            v_tr = [cx + ( right[0]*hw) + ( up[0]*hh),
+                    cy + ( right[1]*hw) + ( up[1]*hh),
+                    cz + ( right[2]*hw) + ( up[2]*hh)]
+            v_tl = [cx + (-right[0]*hw) + ( up[0]*hh),
+                    cy + (-right[1]*hw) + ( up[1]*hh),
+                    cz + (-right[2]*hw) + ( up[2]*hh)]
 
-            # Get image pixel data string, and draw the data to screen at position (x,y,z)
+            glEnable(GL_TEXTURE_2D)
+            glEnable(GL_DEPTH_TEST)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-            glTranslatef(0, 0, self.z)
+            glBindTexture(GL_TEXTURE_2D, self.texture_id)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0, 1); glVertex3fv(v_bl)
+            glTexCoord2f(1, 1); glVertex3fv(v_br)
+            glTexCoord2f(1, 0); glVertex3fv(v_tr)
+            glTexCoord2f(0, 0); glVertex3fv(v_tl)
+            glEnd()
 
-            
-            image_data = pygame.image.tostring(surface, 'RGBA', True)
-            glRasterPos2d(self.x -0.2, self.y - 0.2)
-            glDrawPixels(surface.get_width(), surface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, image_data)
+            glBindTexture(GL_TEXTURE_2D, 0)
+            glDisable(GL_BLEND)
+            glDisable(GL_TEXTURE_2D)
 
-            glTranslatef(0, 0, -(self.z))
-            
 '''
 Geometry Class
+Allows 3D geometry to be rendered to the world scene with different textures and attributes
+'''
 
-Methods for creating in-scene geometry objects such as cubes, spheres, cones, etc.
-
-'''    
 class Geometry:
-    
-    # CLASS - Rectangular Prism
+
+    # Rectangular Prism Class
     class RectangularPrism:
-        
-        # Creates new rectangular prism 3D Object with length, width, height, at x, y, z
+
+        # l, w, h: Length, width, height
+        # x, y, z: Position in world
         def __init__(self, l, w, h, x, y, z):
-            
             self.length = l
-            self.width = w
+            self.width  = w
             self.height = h
-            self.pos_x = x
-            self.pos_y = y
-            self.pos_z = z
-
-            self.tiles = 1
-            
+            self.pos_x  = x
+            self.pos_y  = y
+            self.pos_z  = z
+            self.tiles   = 1
             self.texture = "tex_missing.png"
-            
+
             self.VERTICIES = [
-                [-1,1,-1],
-                [1,1,-1],
-                [1,1,1],
-                [-1,1,1],
-                [-1,-1,-1],
-                [1,-1,-1],
-                [1,-1,1],
-                [-1,-1,1],
-                ]
-                
+                [-1, 1,-1], [ 1, 1,-1], [ 1, 1, 1], [-1, 1, 1],
+                [-1,-1,-1], [ 1,-1,-1], [ 1,-1, 1], [-1,-1, 1],
+            ]
             for vertex in self.VERTICIES:
-                vertex[0] += x
-                vertex[1] += y
-                vertex[2] += z
-                vertex[0] *= w
-                vertex[1] *= h
-                vertex[2] *= l
+                vertex[0] = vertex[0] * w + x
+                vertex[1] = vertex[1] * h + y
+                vertex[2] = vertex[2] * l + z
 
-        # Move / translate the object by moving it in the x,y,z coordinate plane.
         def translate(self, x, y, z):
-            
-            for vertex in self.VERTICIES:
-                vertex[0] += x
-                vertex[1] += y
-                vertex[2] += z
+            for v in self.VERTICIES:
+                v[0] += x; v[1] += y; v[2] += z
 
-        # Transform the object by stretching or shrinking its length, width and/or height.
-        def transform(self, x, y, z):
-            
-            for vertex in self.VERTICIES:
-                vertex[0] *= w
-                vertex[1] *= h
-                vertex[2] *= l
+        def transform(self, w, h, l):
+            for v in self.VERTICIES:
+                v[0] *= w; v[1] *= h; v[2] *= l
 
-        
-        # Render object to screen.
+        def rotate(self, ax, ay, az):
+            _rotate_vertices(self.VERTICIES, ax, ay, az)
+
         def draw(self):
-                
             texture_id = load_texture(self.texture)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
             glBindTexture(GL_TEXTURE_2D, texture_id)
-            glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE )
-            
+            glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
             lights_on()
-            
             glBegin(GL_QUADS)
-            
-            Geometry.RectangularPrism._draw_face(self, [0,1,2,3])
-            Geometry.RectangularPrism._draw_face(self, [4,5,6,7])
-            Geometry.RectangularPrism._draw_face(self, [3,2,6,7])
-            Geometry.RectangularPrism._draw_face(self, [2,1,5,6])
-            Geometry.RectangularPrism._draw_face(self, [1,0,4,5])
-            Geometry.RectangularPrism._draw_face(self, [0,3,7,4])
-  
+            self._draw_face([0,1,2,3])
+            self._draw_face([4,5,6,7])
+            self._draw_face([3,2,6,7])
+            self._draw_face([2,1,5,6])
+            self._draw_face([1,0,4,5])
+            self._draw_face([0,3,7,4])
             glEnd()
-
             lights_off()
-            
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
-            
+
         def _draw_face(self, vertlist):
-                        
-            glTexCoord2f(0,0)
-            glVertex3fv(self.VERTICIES[vertlist[0]])
+            glTexCoord2f(0,         0        ); glVertex3fv(self.VERTICIES[vertlist[0]])
+            glTexCoord2f(self.tiles, 0        ); glVertex3fv(self.VERTICIES[vertlist[1]])
+            glTexCoord2f(self.tiles, self.tiles); glVertex3fv(self.VERTICIES[vertlist[2]])
+            glTexCoord2f(0,         self.tiles); glVertex3fv(self.VERTICIES[vertlist[3]])
 
-            glTexCoord2f(self.tiles,0)
-            glVertex3fv(self.VERTICIES[vertlist[1]])
-
-            glTexCoord2f(self.tiles,self.tiles)
-            glVertex3fv(self.VERTICIES[vertlist[2]])
-
-            glTexCoord2f(0,self.tiles)
-            glVertex3fv(self.VERTICIES[vertlist[3]])
-
-
-        # Applies a new texture to the object, with how many times that texture should be tiled.
-        def apply_texture(self, fp, tiling):
-            
+        def apply_texture(self, fp, tiling=1):
             self.texture = fp
-            self.tiles = tiling
+            self.tiles   = tiling
 
-
-        
-    # CLASS - Triangular Pyramid
+    # Triangular Pyramid
     class TriangularPyramid:
-        
-        # Creates new triangular pyramid 3D Object with length, width, height, at x, y, z
+
+        # l, w, h: Length, width height
+        # x, y, z: Position in world
         def __init__(self, l, w, h, x, y, z):
-            
-            self.length = l
-            self.width = w
-            self.height = h
-            self.pos_x = x
-            self.pos_y = y
-            self.pos_z = z
-
-            self.tiles = 1
-            
+            self.length = l; self.width = w; self.height = h
+            self.pos_x = x; self.pos_y = y; self.pos_z = z
+            self.tiles   = 1
             self.texture = "tex_missing.png"
-            
-            self.TEX_COORDS = [
-                [0,1,1,0,0],
-                [0,0,1,1,0]
-                ]
-            
+
             self.VERTICIES = [
-                [0,1,0],
-                [-1,0,1],
-                [0,0,-1],
-                [1,0,1]
-                ]
-                
-            for vertex in self.VERTICIES:
-                vertex[0] += x
-                vertex[1] += y
-                vertex[2] += z
-                vertex[0] *= w
-                vertex[1] *= h
-                vertex[2] *= l
+                [0, 1, 0], [-1, 0, 1], [0, 0,-1], [1, 0, 1]
+            ]
+            for v in self.VERTICIES:
+                v[0] = (v[0] + x) * w
+                v[1] = (v[1] + y) * h
+                v[2] = (v[2] + z) * l
 
-        # Move / translate the object by moving it in the x,y,z coordinate plane.
         def translate(self, x, y, z):
-            
-            for vertex in self.VERTICIES:
-                vertex[0] += x
-                vertex[1] += y
-                vertex[2] += z
+            for v in self.VERTICIES:
+                v[0] += x; v[1] += y; v[2] += z
 
-        # Transform the object by stretching or shrinking its length, width and/or height.
-        def transform(self, x, y, z):
-            
-            for vertex in self.VERTICIES:
-                vertex[0] *= w
-                vertex[1] *= h
-                vertex[2] *= l
+        def transform(self, w, h, l):
+            for v in self.VERTICIES:
+                v[0] *= w; v[1] *= h; v[2] *= l
 
-        
-        # Render object to screen.
+        def rotate(self, ax, ay, az):
+            _rotate_vertices(self.VERTICIES, ax, ay, az)
+
         def draw(self):
-                
             texture_id = load_texture(self.texture)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
             glBindTexture(GL_TEXTURE_2D, texture_id)
-
             lights_on()
-            
             glBegin(GL_QUADS)
-
-            Geometry.TriangularPyramid._draw_face(self, [1,2,3])
-            Geometry.TriangularPyramid._draw_face(self,[1,0,3])
-            Geometry.TriangularPyramid._draw_face(self,[3,0,2])
-            Geometry.TriangularPyramid._draw_face(self,[2,0,1])
-                    
+            self._draw_face([1,2,3])
+            self._draw_face([1,0,3])
+            self._draw_face([3,0,2])
+            self._draw_face([2,0,1])
             glEnd()
-
             lights_off()
-            
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
 
         def _draw_face(self, vertlist):
+            glTexCoord2f(0,          0         ); glVertex3fv(self.VERTICIES[vertlist[0]])
+            glTexCoord2f(0,          self.tiles ); glVertex3fv(self.VERTICIES[vertlist[1]])
+            glTexCoord2f(self.tiles, self.tiles ); glVertex3fv(self.VERTICIES[vertlist[2]])
+            glTexCoord2f(self.tiles, 0          ); glVertex3fv(self.VERTICIES[vertlist[0]])
 
-            glTexCoord2f(0,0)
-            glVertex3fv(self.VERTICIES[vertlist[0]])
+        def apply_texture(self, fp, tiling=1):
+            self.texture = fp; self.tiles = tiling
 
-            glTexCoord2f(0,self.tiles)
-            glVertex3fv(self.VERTICIES[vertlist[1]])
-
-            glTexCoord2f(self.tiles,self.tiles)
-            glVertex3fv(self.VERTICIES[vertlist[2]])
-
-            glTexCoord2f(self.tiles,0)
-            glVertex3fv(self.VERTICIES[vertlist[0]])
-        
-        # Applies a new texture to the object, with how many times that texture should be tiled.
-        def apply_texture(self, fp, tiling):
-            
-            self.texture = fp
-            self.tiles = tiling
-
-    # CLASS - Rectangular Pyramid
+    # Pyramid Class
     class Pyramid:
-        
-        # Creates new pyramid 3D Object with length, width, height, at x, y, z
+
+        # l, w, h: length, width, height
+        # x, y, z: Position in world
         def __init__(self, l, w, h, x, y, z):
-            
-            self.length = l
-            self.width = w
-            self.height = h
-            self.pos_x = x
-            self.pos_y = y
-            self.pos_z = z
-
-            self.tiles = 1
-            
+            self.length = l; self.width = w; self.height = h
+            self.pos_x = x; self.pos_y = y; self.pos_z = z
+            self.tiles   = 1
             self.texture = "tex_missing.png"
-            
-            self.TEX_COORDS = [
-                [0,1,1,0,0],
-                [0,0,1,1,0]
-                ]
-            
+
             self.VERTICIES = [
-                [0,1,0],
-                [-1,0,1],
-                [1,0,1],
-                [1,0,-1],
-                [-1,0,-1]
-                ]
-                
-            for vertex in self.VERTICIES:
-                vertex[0] += x
-                vertex[1] += y
-                vertex[2] += z
-                vertex[0] *= w
-                vertex[1] *= h
-                vertex[2] *= l
+                [0, 1, 0], [-1, 0, 1], [1, 0, 1], [1, 0,-1], [-1, 0,-1]
+            ]
+            for v in self.VERTICIES:
+                v[0] = (v[0] + x) * w
+                v[1] = (v[1] + y) * h
+                v[2] = (v[2] + z) * l
 
-        # Move / translate the object by moving it in the x,y,z coordinate plane.
         def translate(self, x, y, z):
-            
-            for vertex in self.VERTICIES:
-                vertex[0] += x
-                vertex[1] += y
-                vertex[2] += z
+            for v in self.VERTICIES:
+                v[0] += x; v[1] += y; v[2] += z
 
-        # Transform the object by stretching or shrinking its length, width and/or height.
-        def transform(self, x, y, z):
-            
-            for vertex in self.VERTICIES:
-                vertex[0] *= w
-                vertex[1] *= h
-                vertex[2] *= l
+        def transform(self, w, h, l):
+            for v in self.VERTICIES:
+                v[0] *= w; v[1] *= h; v[2] *= l
 
-        
-        # Render object to screen.
+        def rotate(self, ax, ay, az):
+            _rotate_vertices(self.VERTICIES, ax, ay, az)
+
         def draw(self):
-                
             texture_id = load_texture(self.texture)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
             glBindTexture(GL_TEXTURE_2D, texture_id)
-
             lights_on()
-            
             glBegin(GL_QUADS)
-
-            Geometry.TriangularPyramid._draw_face(self, [0,1,2])
-            Geometry.TriangularPyramid._draw_face(self, [0,2,3])
-            Geometry.TriangularPyramid._draw_face(self, [0,3,4])
-            Geometry.TriangularPyramid._draw_face(self, [0,4,1])
-
-            glTexCoord2f(0,0)
-            glVertex3fv(self.VERTICIES[1])
-            
-            glTexCoord2f(self.tiles,0)
-            glVertex3fv(self.VERTICIES[2])
-            
-            glTexCoord2f(self.tiles,self.tiles)
-            glVertex3fv(self.VERTICIES[3])
-            
-            glTexCoord2f(0,self.tiles)
-            glVertex3fv(self.VERTICIES[4])
-
-            glTexCoord2f(0,0)
-            glVertex3fv(self.VERTICIES[1])
-                    
+            self._draw_face([0,1,2])
+            self._draw_face([0,2,3])
+            self._draw_face([0,3,4])
+            self._draw_face([0,4,1])
+            glTexCoord2f(0,          0         ); glVertex3fv(self.VERTICIES[1])
+            glTexCoord2f(self.tiles, 0         ); glVertex3fv(self.VERTICIES[2])
+            glTexCoord2f(self.tiles, self.tiles ); glVertex3fv(self.VERTICIES[3])
+            glTexCoord2f(0,          self.tiles ); glVertex3fv(self.VERTICIES[4])
             glEnd()
-
             lights_off()
-            
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
 
         def _draw_face(self, vertlist):
+            glTexCoord2f(0,          0         ); glVertex3fv(self.VERTICIES[vertlist[0]])
+            glTexCoord2f(0,          self.tiles ); glVertex3fv(self.VERTICIES[vertlist[1]])
+            glTexCoord2f(self.tiles, self.tiles ); glVertex3fv(self.VERTICIES[vertlist[2]])
+            glTexCoord2f(self.tiles, 0          ); glVertex3fv(self.VERTICIES[vertlist[0]])
 
-            glTexCoord2f(0,0)
-            glVertex3fv(self.VERTICIES[vertlist[0]])
+        def apply_texture(self, fp, tiling=1):
+            self.texture = fp; self.tiles = tiling
 
-            glTexCoord2f(0,self.tiles)
-            glVertex3fv(self.VERTICIES[vertlist[1]])
-
-            glTexCoord2f(self.tiles,self.tiles)
-            glVertex3fv(self.VERTICIES[vertlist[2]])
-
-            glTexCoord2f(self.tiles,0)
-            glVertex3fv(self.VERTICIES[vertlist[0]])
-        
-        # Applies a new texture to the object, with how many times that texture should be tiled.
-        def apply_texture(self, fp, tiling):
-            
-            self.texture = fp
-            self.tiles = tiling
-
-    # CLASS - Sphere
+    # Sphere Class
     class Sphere:
-        
-        # Creates new Sphere Object with radius, at x, y, z
+
+        # r: Sphere radius
+        # x, y, z: Position in world
         def __init__(self, r, x, y, z):
-            
             self.radius = r
-            self.pos_x = x
-            self.pos_y = y
-            self.pos_z = z
-
+            self.pos_x  = x; self.pos_y = y; self.pos_z = z
+            self.rot_x  = 0.0; self.rot_y = 0.0; self.rot_z = 0.0
             self.texture = "tex_missing.png"
-            
-        # Move / translate the object by moving it in the x,y,z coordinate plane.
-        def translate(self, x, y, z):
-            
-            self.pos_x += x
-            self.pos_y += y
-            self.pos_z += z
+            self._qobj   = gluNewQuadric()   # created once, reused every frame
+            gluQuadricTexture(self._qobj, GL_TRUE)
 
-        # Transform the object by stretching or shrinking its length, width and/or height.
+        def translate(self, x, y, z):
+            self.pos_x += x; self.pos_y += y; self.pos_z += z
+
         def transform(self, r):
-            
-            self *= r
+            self.radius *= r
 
-        
-        # Render object to screen.
+        def rotate(self, ax, ay, az):
+            self.rot_x = (self.rot_x + ax) % 360
+            self.rot_y = (self.rot_y + ay) % 360
+            self.rot_z = (self.rot_z + az) % 360
+
         def draw(self):
             glTranslatef(self.pos_x, self.pos_y, self.pos_z)
             glRotatef(90, 1, 0, 0)
+            glRotatef(self.rot_x, 1, 0, 0)
+            glRotatef(self.rot_y, 0, 1, 0)
+            glRotatef(self.rot_z, 0, 0, 1)
 
-            
-            qobj = gluNewQuadric()
-            gluQuadricTexture(qobj, GL_TRUE)
-            
             texture_id = load_texture(self.texture)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
             glBindTexture(GL_TEXTURE_2D, texture_id)
-
             lights_on()
-            
-            gluSphere(qobj, self.radius, 20, 20)
-            
+            gluSphere(self._qobj, self.radius, 32, 32)
+            lights_off()
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
 
-            lights_off()
-            
-            gluDeleteQuadric(qobj)
-            
+            glRotatef(-self.rot_z, 0, 0, 1)
+            glRotatef(-self.rot_y, 0, 1, 0)
+            glRotatef(-self.rot_x, 1, 0, 0)
             glRotatef(-90, 1, 0, 0)
             glTranslatef(-self.pos_x, -self.pos_y, -self.pos_z)
-        
-        # Applies a new texture to the object.
+
         def apply_texture(self, fp):
-            
             self.texture = fp
 
-    # CLASS - Cylinder
+    # Cylinder Class
     class Cylinder:
-        
-        # Creates new Cylinder Object with bottom and top radii, height, at x, y, z
+
+        # b: Bottom radius
+        # t: Top radius
+        # h: Height
+        # x, y, z: Position in world
         def __init__(self, b, t, h, x, y, z):
-            
-            self.bottom_radius = b
-            self.top_radius = t
-            self.height = h
-            self.pos_x = x
-            self.pos_y = y
-            self.pos_z = z
-
+            self.bottom_radius = b; self.top_radius = t; self.height = h
+            self.pos_x = x; self.pos_y = y; self.pos_z = z
+            self.rot_x = 0.0; self.rot_y = 0.0; self.rot_z = 0.0
             self.texture = "tex_missing.png"
-            
-        # Move / translate the object by moving it in the x,y,z coordinate plane.
+            self._qobj   = gluNewQuadric()
+            gluQuadricTexture(self._qobj, GL_TRUE)
+
         def translate(self, x, y, z):
-            
-            self.pos_x += x
-            self.pos_y += y
-            self.pos_z += z
+            self.pos_x += x; self.pos_y += y; self.pos_z += z
 
-        # Transform the object by stretching or shrinking its length, width and/or height.
         def transform(self, b, t, h):
-            
-            self.bottom_radius *= b
-            self.top_radius *= t
-            self.height *= h
+            self.bottom_radius *= b; self.top_radius *= t; self.height *= h
 
-        
-        # Render object to screen.
+        def rotate(self, ax, ay, az):
+            self.rot_x = (self.rot_x + ax) % 360
+            self.rot_y = (self.rot_y + ay) % 360
+            self.rot_z = (self.rot_z + az) % 360
+
         def draw(self):
             glTranslatef(self.pos_x, self.pos_y, self.pos_z)
             glRotatef(90, 1, 0, 0)
+            glRotatef(self.rot_x, 1, 0, 0)
+            glRotatef(self.rot_y, 0, 1, 0)
+            glRotatef(self.rot_z, 0, 0, 1)
 
-            qobj = gluNewQuadric()
-            gluQuadricTexture(qobj, GL_TRUE)
-            
             texture_id = load_texture(self.texture)
-            
             glEnable(GL_TEXTURE_2D)
             glEnable(GL_DEPTH_TEST)
-            
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
             glBindTexture(GL_TEXTURE_2D, texture_id)
-
             lights_on()
-            
-            gluCylinder(qobj, self.bottom_radius, self.top_radius, self.height, 8, 8)
-            
+            gluCylinder(self._qobj, self.bottom_radius, self.top_radius, self.height, 32, 32)
+            lights_off()
             glBindTexture(GL_TEXTURE_2D, 0)
             glDisable(GL_TEXTURE_2D)
 
-            lights_off()
-
-            gluDeleteQuadric(qobj)
-            
+            glRotatef(-self.rot_z, 0, 0, 1)
+            glRotatef(-self.rot_y, 0, 1, 0)
+            glRotatef(-self.rot_x, 1, 0, 0)
             glRotatef(-90, 1, 0, 0)
             glTranslatef(-self.pos_x, -self.pos_y, -self.pos_z)
-        
-        # Applies a new texture to the object.
+
         def apply_texture(self, fp):
-            
             self.texture = fp
-            
+
+    # Disk Class
+    class Disk:
+
+        # i: Inner ring radius
+        # o: Outer ring radius
+        # x, y, z: Position in world
+        def __init__(self, i, o, x, y, z):
+            self.inner_radius = i; self.outer_radius = o
+            self.pos_x = x; self.pos_y = y; self.pos_z = z
+            self.rot_x = 0.0; self.rot_y = 0.0; self.rot_z = 0.0
+            self.texture = "tex_missing.png"
+            self._qobj   = gluNewQuadric()
+            gluQuadricTexture(self._qobj, GL_TRUE)
+
+        def translate(self, x, y, z):
+            self.pos_x += x; self.pos_y += y; self.pos_z += z
+
+        def transform(self, inner, outer):
+            self.inner_radius *= inner; self.outer_radius *= outer
+
+        def rotate(self, ax, ay, az):
+            self.rot_x = (self.rot_x + ax) % 360
+            self.rot_y = (self.rot_y + ay) % 360
+            self.rot_z = (self.rot_z + az) % 360
+
+        def draw(self):
+            glTranslatef(self.pos_x, self.pos_y, self.pos_z)
+            glRotatef(90, 1, 0, 0)
+            glRotatef(self.rot_x, 1, 0, 0)
+            glRotatef(self.rot_y, 0, 1, 0)
+            glRotatef(self.rot_z, 0, 0, 1)
+
+            texture_id = load_texture(self.texture)
+            glEnable(GL_TEXTURE_2D)
+            glEnable(GL_DEPTH_TEST)
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
+            glBindTexture(GL_TEXTURE_2D, texture_id)
+            lights_on()
+            gluDisk(self._qobj, self.inner_radius, self.outer_radius, 32, 1)
+            lights_off()
+            glBindTexture(GL_TEXTURE_2D, 0)
+            glDisable(GL_TEXTURE_2D)
+
+            glRotatef(-self.rot_z, 0, 0, 1)
+            glRotatef(-self.rot_y, 0, 1, 0)
+            glRotatef(-self.rot_x, 1, 0, 0)
+            glRotatef(-90, 1, 0, 0)
+            glTranslatef(-self.pos_x, -self.pos_y, -self.pos_z)
+
+        def apply_texture(self, fp):
+            self.texture = fp
+
 '''
 Font Class
+Handles drawing 2D Text over the screen, like a HUD
+'''
 
-Methods for rendering fonts on screen.
-
-'''  
 class Font:
-    
-    # Draws default pygame font at (x, y) with str text, with fg and bg colors, with size in px
-    # Input: float x, floay y, str text, (r,g,b,a), (r,g,b,a), int size
-    
-    def draw_rgba(x, y, font, text, color, bg_color, size):        
+
+    # Draw text with a solid background color (original behavior)
+    def draw_rgba(x, y, font, text, color, bg_color, size):
+        global FONT_CACHE
+
+        cache_key = (text, font, size, color, bg_color)
+
+        if cache_key not in FONT_CACHE:
+            try:
+                f = pygame.font.Font(font, size)
+            except:
+                print("Open-X [WARNING] >> Unable to load font! Reverting to default.")
+                f = pygame.font.Font(pygame.font.get_default_font(), size)
+
+            surface = f.render(text, True, color, bg_color)
+            raw     = pygame.image.tostring(surface, "RGBA", True)
+            FONT_CACHE[cache_key] = (surface.get_width(), surface.get_height(), raw)
+
+        w, h, raw = FONT_CACHE[cache_key]
+        glWindowPos2d(x, y)
+        glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+
+    # Draw text with a transparent background.
+    # color is an (R, G, B, A) tuple -- A controls text opacity, 255 = fully opaque
+    def draw(x, y, font, text, color, size):
+        global FONT_CACHE
+
+        cache_key = ("TRANSPARENT", text, font, size, color)
+
+        if cache_key not in FONT_CACHE:
+            try:
+                f = pygame.font.Font(font, size)
+            except:
+                print("Open-X [WARNING] >> Unable to load font! Reverting to default.")
+                f = pygame.font.Font(pygame.font.get_default_font(), size)
+
+            # Render onto a per-pixel alpha surface so background stays transparent
+            text_surf = f.render(text, True, color[:3])
+            surface   = pygame.Surface(text_surf.get_size(), pygame.SRCALPHA)
+            surface.fill((0, 0, 0, 0))
+            surface.blit(text_surf, (0, 0))
+
+            # Apply the alpha channel from the color tuple
+            if len(color) == 4:
+                surface.set_alpha(color[3])
+
+            raw = pygame.image.tostring(surface, "RGBA", True)
+            FONT_CACHE[cache_key] = (surface.get_width(), surface.get_height(), raw)
+
+        w, h, raw = FONT_CACHE[cache_key]
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glWindowPos2d(x, y)
+        glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        glDisable(GL_BLEND)
+
+    # Draw transparent text that re-renders every frame.
+    # Use this for dynamic text that changes frequently, as caching is disabled so resources are not taken
+    def draw_dynamic(x, y, font, text, color, size):
 
         try:
-            
-            font = pygame.font.Font(font, size)
-            
+            f = pygame.font.Font(font, size)
         except:
+            print("Open-X [WARNING] >> Unable to load font! Reverting to default.")
+            f = pygame.font.Font(pygame.font.get_default_font(), size)
 
-            print("Open-X [WARNING] >> Unable to load font filepath '" + filepath + "'! Reverting to default font.")
-            font = pygame.font.Font(pygame.font.get_default_font(), size)
-        
-        textSurface = font.render(text, True, color, bg_color)
-        textData = pygame.image.tostring(textSurface, "RGBA", True)
+        text_surf = f.render(text, True, color[:3])
+        surface   = pygame.Surface(text_surf.get_size(), pygame.SRCALPHA)
+        surface.fill((0, 0, 0, 0))
+        surface.blit(text_surf, (0, 0))
+
+        if len(color) == 4:
+            surface.set_alpha(color[3])
+
+        raw = pygame.image.tostring(surface, "RGBA", True)
+        w, h = surface.get_size()
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glWindowPos2d(x, y)
-        glDrawPixels(textSurface.get_width(), textSurface.get_height(), GL_RGBA, GL_UNSIGNED_BYTE, textData)
+        glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        glDisable(GL_BLEND)
 
 '''
-
 XObject Class
-Allows for the use of custom 3D models made using the '.xobj' file format
-
+Allows basic custom quad modelling and rendering
 '''
-        
+
 class XObject:
-    
-    # Creates a new XObject with xobj file at path fp with position x, y, z and transform of l, w, h
+
     def __init__(self, fp, x, y, z, l, w, h):
-        
-        self.pos_x = x
-        self.pos_y = y
-        self.pos_z = z
-        self.length = l
-        self.width = w
-        self.height = h
+        self.pos_x = x; self.pos_y = y; self.pos_z = z
+        self.length = l; self.width = w; self.height = h
         self.filepath = fp
-    
         self.VERTICIES = []
-        self.FACES = []
-        
-        self.texture = "tex_missing.png"
-        self.tiles = 1
-        
-        with open(os.getcwd() + "/" + self.filepath, "r") as file:
-            lines = [line.rstrip() for line in file]
-            
-            for line in lines:
-                
+        self.FACES     = []
+        self.texture   = "tex_missing.png"
+        self.tiles     = 1
+
+        with open(os.getcwd() + "/" + fp, "r") as file:
+            for line in file:
+                line = line.rstrip()
+                if not line:
+                    continue
                 if line[0] == "v":
-                    
-                    
-                    l = []
-        
+                    vals = []
                     for t in line.split():
-                        
-                        try:
-                            l.append(float(t))
-                            
-                        except ValueError:
-                            pass
-                        
-                        
-                    self.VERTICIES.append(l)
-                    
-                if line[0] == "f":
-                    
-                    
-                    l = []
-        
+                        try: vals.append(float(t))
+                        except ValueError: pass
+                    self.VERTICIES.append(vals)
+                elif line[0] == "f":
+                    vals = []
                     for t in line.split():
-                        
-                        try:
-                            l.append(int(t))
-                            
-                        except ValueError:
-                            pass
-                        
-                        
-                    self.FACES.append(l)
-                        
-    # Move / translate the object by moving it in the x,y,z coordinate plane.
+                        try: vals.append(int(t))
+                        except ValueError: pass
+                    self.FACES.append(vals)
+
     def translate(self, x, y, z):
-            
-        self.pos_x += x
-        self.pos_y += y
-        self.pos_z += z
-        
-    # Renders the XObject in the scene
+        self.pos_x += x; self.pos_y += y; self.pos_z += z
+
     def draw(self):
-        
         texture_id = load_texture(self.texture)
-            
         glEnable(GL_TEXTURE_2D)
         glEnable(GL_DEPTH_TEST)
-            
-        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0);
-            
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 0, 0)
         glBindTexture(GL_TEXTURE_2D, texture_id)
-        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE )
-            
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         lights_on()
-            
         glBegin(GL_QUADS)
-        
-        for i in range(len(self.FACES)):
-            XObject._draw_face(self, self.FACES[i])
-  
+        for face in self.FACES:
+            self._draw_face(face)
         glEnd()
-
         lights_off()
-            
         glBindTexture(GL_TEXTURE_2D, 0)
         glDisable(GL_TEXTURE_2D)
-        
-        
+
     def _draw_face(self, vertlist):
-        
-        #print(vertlist)
-
-        glTexCoord2f(0,0)
-        glVertex3fv(self.VERTICIES[vertlist[0] - 1])
-
-        glTexCoord2f(0,self.tiles)
-        glVertex3fv(self.VERTICIES[vertlist[1] - 1])
-
-        glTexCoord2f(self.tiles,self.tiles)
-        glVertex3fv(self.VERTICIES[vertlist[2] - 1])
-        
+        glTexCoord2f(0,          0         ); glVertex3fv(self.VERTICIES[vertlist[0]-1])
+        glTexCoord2f(0,          self.tiles ); glVertex3fv(self.VERTICIES[vertlist[1]-1])
+        glTexCoord2f(self.tiles, self.tiles ); glVertex3fv(self.VERTICIES[vertlist[2]-1])
         try:
-            glTexCoord2f(self.tiles,0)
-            glVertex3fv(self.VERTICIES[vertlist[3] - 1])
-        except:
-            glTexCoord2f(self.tiles,0)
-            glVertex3fv(self.VERTICIES[vertlist[0] - 1])
-        
-        
-    # Applies a new texture to the object (with tiling factor).
-    def apply_texture(self, fp, tiling):
+            glTexCoord2f(self.tiles, 0); glVertex3fv(self.VERTICIES[vertlist[3]-1])
+        except IndexError:
+            glTexCoord2f(self.tiles, 0); glVertex3fv(self.VERTICIES[vertlist[0]-1])
+
+    def apply_texture(self, fp, tiling=1):
+        self.texture = fp; self.tiles = tiling
+
+'''
+Alpha Audio Class
+Experimental class that handles music and sound effect managment
+'''
+
+class Audio:
+
+    class Mixer:
+
+        def load(fp):
+            pygame.mixer.music.load(fp, "ogg")
+
+        def unload():
+            pygame.mixer.music.unload()
+
+        def play(loops=1, start=0.0, fade=0):
+            pygame.mixer.music.play((loops-1), start, fade)
+
+        def rewind():
+            pygame.mixer.music.rewind()
+
+        def stop():
+            pygame.mixer.music.stop()
+
+        def pause():
+            pygame.mixer.music.pause()
+
+        def unpause():
+            pygame.mixer.music.unpause()
+
+        def fadeout(time):
+            pygame.mixer.music.fadeout(time * 1000)
+
+        def set_volume(vol):
+            pygame.mixer.music.set_volume(vol)
+
+        def get_volume():
+            return pygame.mixer.music.get_volume()
+
+        def busy():
+            return pygame.mixer.music.get_busy()
+
+        def seek(timestamp):
+            pygame.mixer.music.set_pos(timestamp)
+
+        def timestamp():
+            return pygame.mixer.music.get_pos()
+
+        def queue(fp, loops=1):
+            pygame.mixer.music.queue(fp, "ogg", (loops-1))
+
+    class SFX:
+
+        def __init__(self, fp, x=0, y=0, z=0, d=0):
+            self.filepath = fp
+            self.x = x; self.y = y; self.z = z
+            self.d   = d * 10
+            self.sfx = pygame.mixer.Sound(fp)
+
+        def play(self, loops=1, fade=0):
+            self.sfx.play((loops-1), 0, fade)
+
+        def stop(self, fade=0):
+            if fade == 0:
+                self.sfx.stop()
+            else:
+                self.sfx.fadeout(fade)
+
+        def set_volume(self, vol):
+            self.sfx.set_volume(vol)
+
+        def get_volume(self):
+            return self.sfx.get_volume()
+
+        def length(self):
+            return self.sfx.get_length()
+
+        def calculate_att(self):
+            global CAMERA_POS
+            dx = self.x - CAMERA_POS[0]
+            dy = self.y - CAMERA_POS[1]
+            dz = self.z - CAMERA_POS[2]
+            distance = math.sqrt(dx*dx + dy*dy + dz*dz)
+
+            if self.d <= 0.0:
+                self.set_volume(1.0)
+                return
+
+            ratio  = max(0.0, min(distance, self.d)) / self.d
+            result = (1.0 - ratio) ** 2
+            self.set_volume(result)
+
+'''
+Alpha Collision Class
+An alpha build of collision detection. Very basic AABB collision detection and caching
+'''
+
+class Collision:
+
+    # Hitbox object
+    class Hitbox:
+
+        # Make a new hitbox with width, length, height, and x, y, z position
+        def __init__(self, l, w, h, x, y, z):
+            self.length = l
+            self.width  = w
+            self.height = h
+            self.pos_x  = x
+            self.pos_y  = y
+            self.pos_z  = z
+
+            self.VERTICIES = [
+                [-1, 1,-1], [ 1, 1,-1], [ 1, 1, 1], [-1, 1, 1],
+                [-1,-1,-1], [ 1,-1,-1], [ 1,-1, 1], [-1,-1, 1],
+            ]
             
-        self.texture = fp
-        self.tiles = tiling
+            for vertex in self.VERTICIES:
+                vertex[0] = vertex[0] * w + x
+                vertex[1] = vertex[1] * h + y
+                vertex[2] = vertex[2] * l + z
+
+            WORLD_HITBOXES.append(self)
+
+        # Translate hitbox
+        def translate(self, x, y, z):
+            for v in self.VERTICIES:
+                v[0] += x; v[1] += y; v[2] += z
+
+        # Transform hitbox
+        def transform(self, w, h, l):
+            for v in self.VERTICIES:
+                v[0] *= w; v[1] *= h; v[2] *= l
+
+        # Rotate hitbox
+        def rotate(self, ax, ay, az):
+            _rotate_vertices(self.VERTICIES, ax, ay, az)
+
+        # Set position
+        def set_pos(self, x, y, z):
+            dx = x - self.pos_x
+            dy = y - self.pos_y
+            dz = z - self.pos_z
+            self.translate(dx, dy, dz)
+            self.pos_x = x
+            self.pos_y = y
+            self.pos_z = z
+
+        # Takes another hitbox object in: returns true if this hitbox it is colliding with it
+        def collides_with(self, other):
+            # Derive AABB from vertices for self
+            a_xs = [v[0] for v in self.VERTICIES]
+            a_ys = [v[1] for v in self.VERTICIES]
+            a_zs = [v[2] for v in self.VERTICIES]
+
+            # Derive AABB from vertices for other
+            b_xs = [v[0] for v in other.VERTICIES]
+            b_ys = [v[1] for v in other.VERTICIES]
+            b_zs = [v[2] for v in other.VERTICIES]
+
+            # Overlap on all three axes = collision
+            return (min(a_xs) <= max(b_xs) and max(a_xs) >= min(b_xs) and
+                    min(a_ys) <= max(b_ys) and max(a_ys) >= min(b_ys) and
+                    min(a_zs) <= max(b_zs) and max(a_zs) >= min(b_zs))
+
+        # Returns True if this hitbox is colliding with any other hitbox
+        def hits_barrier(self):
+
+            for other in WORLD_HITBOXES:
+                if other is self:
+                    continue
+                if self.collides_with(other):
+                    return True
+
+            return False
+
+        # Draws an outline of the hitbox
+        def draw(self, color=(0, 1, 0)):
+
+            xs = [v[0] for v in self.VERTICIES]
+            ys = [v[1] for v in self.VERTICIES]
+            zs = [v[2] for v in self.VERTICIES]
+
+            x_min, x_max = min(xs), max(xs)
+            y_min, y_max = min(ys), max(ys)
+            z_min, z_max = min(zs), max(zs)
+
+            # 8 corners of the AABB
+            corners = [
+                (x_min, y_min, z_min), (x_max, y_min, z_min),
+                (x_max, y_max, z_min), (x_min, y_max, z_min),
+                (x_min, y_min, z_max), (x_max, y_min, z_max),
+                (x_max, y_max, z_max), (x_min, y_max, z_max),
+            ]
+
+            # 12 edges connecting the corners
+            edges = [
+                (0,1),(1,2),(2,3),(3,0),  # back face
+                (4,5),(5,6),(6,7),(7,4),  # front face
+                (0,4),(1,5),(2,6),(3,7),  # connecting edges
+            ]
+
+            glDisable(GL_LIGHTING)
+            glDisable(GL_TEXTURE_2D)
+            glColor3f(*color)
+
+            glBegin(GL_LINES)
+            for a, b in edges:
+                glVertex3fv(corners[a])
+                glVertex3fv(corners[b])
+            glEnd()
+
+            glColor3f(1, 1, 1)
+            glEnable(GL_LIGHTING)
+            glEnable(GL_TEXTURE_2D)
+            
+
+'''
+Debug Class
+Handles debug information and alpha version testing functions
+'''
+
+class Debug:
+
+    # Returns current FPS
+    def get_fps():
+        return round(CLOCK.get_fps())
+
+    # Returns memory free in GB
+    def get_mem():
+        virtual_memory = psutil.virtual_memory()
+        available_bytes = virtual_memory.available
+        available_gb = available_bytes / (1024 ** 3)
+        return round(available_gb, 2)
+
+
+def DEBUG_CODEHS_MODE():
+    global RENDER_WIDTH, RENDER_HEIGHT, WINDOW_SCALE
+    RENDER_WIDTH  = 320
+    RENDER_HEIGHT = 240
+    WINDOW_SCALE  = 2
