@@ -1,33 +1,11 @@
-# Open-X Version 1.4 - Optimized Build
+# Open-X Version 1.4.1
 # Developed by Madden Wilkins
 
-# Billboard draw() no longer re-uploads texture every frame
-# Polygon rotate() uses numpy matrix math instead of per-vertex Python loops
-# Quadric objects (Sphere, Cylinder, Disk) cache their GLU quadric handle
-# flip(): removed pygame.time.wait(10) - main source of FPS drops
-# lights_on/off() consolidated, redundant state calls removed
-# Font.draw_rgba() caches rendered surfaces by (text, font, size, color)
-#  Added Font.draw() which has a transparent background
-#  Added Font.draw_dynamic(), same as draw() but doesn't cache the text (useful for fast changing information to not overload the cache and use up resources)
-# Ceiling/Floor draw() removes dead tcoords/surfs variables and an extra vertex
-# _rotate_vertices() shared helper function now replaces duplicated rotate() in every Geometry class
-# Added transparent billboard support
-# Changed billboards to utilize quad rendering, allowing for accurate proportions
-# Got rid of coord_to_scale(), was obsolete
-# Changed resolution to a scalable 1600 * 1200 on PC
-# Added Audio class
-# Added CodeHS Mode: limits resolution to 360 * 240, upscaled 3 times; and disables audio support
-# Changed Controller class to just return pressed keyboard keys as a list
-# Changed Controller class to allow for mouse based rotation
-# Changed Controller class to have new mode() function
-# Added Mipmaps
-# Changed how textures are rendered to improve performance
-# Textures can now be HD
-# Overhauled Camera Class
-# Added new rotate() to all Geometry
-# Added more vertices spheres and cylinders
-# Added hitbox system
-# Added new Debug class
+# Added new effects in a new FX class:
+    # Pixel mosaic effect using pixelate() and depixelate()
+    # Dissolve screen effect using dissolve_out() and dissolve_in()
+    # Wipe effect using wipe_in() and wipe_out()
+# Removed GPU name check
 
 import pygame
 from pygame.locals import *
@@ -43,7 +21,6 @@ import psutil
 import numpy as np
 from PIL import Image
 
-
 import re
 
 pygame.font.init()
@@ -52,7 +29,7 @@ CLOCK = pygame.time.Clock()
 
 # Global constants
 
-CAMERA_POS   = [0, 0, 0]
+CAMERA_POS   = [0, 0, -6.5]
 CAMERA_YAW   = 0.0
 CAMERA_PITCH = 0.0
 CAMERA_ROLL  = 0.0
@@ -63,6 +40,28 @@ FLOOR_TEX    = "tex_missing.png"
 TEXTURE_CACHE = {}
 FONT_CACHE    = {}   # (text, fp, size, color, bg_color) -> (w, h, bytes)
 WORLD_HITBOXES = []
+
+# FX constants
+
+MOSAIC_LEVEL  = 1.0   # 1.0 = no effect, higher = less res
+MOSAIC_TARGET = 1.0
+MOSAIC_SPEED  = 0.0
+MOSAIC_FBO    = None
+MOSAIC_TEX    = None
+
+DISSOLVE_MASK    = None
+DISSOLVE_QUEUE   = None   # list of unflipped pixel indices, consumed in order
+DISSOLVE_INDEX   = 0
+DISSOLVE_RATE    = 0
+DISSOLVE_MODE    = None
+DISSOLVE_ACTIVE  = False
+DISSOLVE_BLOCK   = 8
+
+WIPE_PROGRESS  = 0.0
+WIPE_TARGET    = 0.0
+WIPE_SPEED     = 0.0
+WIPE_DIRECTION = 'right'
+WIPE_ACTIVE    = False
 
 # Render resolution
 RENDER_WIDTH  = 1600
@@ -109,34 +108,107 @@ def _rotate_vertices(vertices, ax, ay, az):
     for i, v in enumerate(vertices):
         v[0], v[1], v[2] = arr[i]
 
+def _step_dissolve():
+    global DISSOLVE_ACTIVE, DISSOLVE_INDEX
+
+    if not DISSOLVE_ACTIVE:
+        return
+
+    total = len(DISSOLVE_QUEUE)
+    end   = min(DISSOLVE_INDEX + DISSOLVE_RATE, total)
+    batch = DISSOLVE_QUEUE[DISSOLVE_INDEX:end]
+
+    for br, bc in batch:
+        r_end = min(br + DISSOLVE_BLOCK, RENDER_HEIGHT)
+        c_end = min(bc + DISSOLVE_BLOCK, RENDER_WIDTH)
+
+        if DISSOLVE_MODE == 'out':
+            DISSOLVE_MASK[br:r_end, bc:c_end] = [0, 0, 0, 255]
+        else:
+            DISSOLVE_MASK[br:r_end, bc:c_end] = [0, 0, 0, 0]
+
+    DISSOLVE_INDEX = end
+    if DISSOLVE_INDEX >= total:
+        DISSOLVE_ACTIVE = False
+
+def _draw_wipe():
+    global WIPE_PROGRESS, WIPE_ACTIVE
+
+    if not WIPE_ACTIVE and WIPE_PROGRESS <= 0.0:
+        return
+
+    if WIPE_PROGRESS < WIPE_TARGET:
+        WIPE_PROGRESS = min(WIPE_PROGRESS + WIPE_SPEED, WIPE_TARGET)
+    elif WIPE_PROGRESS > WIPE_TARGET:
+        WIPE_PROGRESS = max(WIPE_PROGRESS - WIPE_SPEED, WIPE_TARGET)
+
+    if abs(WIPE_PROGRESS - WIPE_TARGET) < 0.001:
+        WIPE_PROGRESS = WIPE_TARGET
+        WIPE_ACTIVE   = False
+
+    if WIPE_PROGRESS <= 0.0:
+        return
+
+    p  = WIPE_PROGRESS
+    rw = RENDER_WIDTH
+    rh = RENDER_HEIGHT
+
+    if   WIPE_DIRECTION == 'right': x1,y1,x2,y2 = 0,            0,  int(rw*p),   rh
+    elif WIPE_DIRECTION == 'left':  x1,y1,x2,y2 = int(rw*(1-p)),0,  rw,          rh
+    elif WIPE_DIRECTION == 'up':    x1,y1,x2,y2 = 0,            0,  rw,          int(rh*p)
+    elif WIPE_DIRECTION == 'down':  x1,y1,x2,y2 = 0,int(rh*(1-p)),  rw,          rh
+
+    glBindFramebuffer(GL_FRAMEBUFFER, FBO)
+
+    # Save ALL affected state — nothing leaks out
+    glPushAttrib(GL_ENABLE_BIT | GL_COLOR_BUFFER_BIT | GL_CURRENT_BIT)
+
+    glDisable(GL_DEPTH_TEST)
+    glDisable(GL_TEXTURE_2D)
+    glDisable(GL_LIGHTING)
+    glDisable(GL_COLOR_MATERIAL)
+    glDisable(GL_BLEND)
+
+    glMatrixMode(GL_PROJECTION)
+    glPushMatrix()
+    glLoadIdentity()
+    glOrtho(0, RENDER_WIDTH, 0, RENDER_HEIGHT, -1, 1)
+    glMatrixMode(GL_MODELVIEW)
+    glPushMatrix()
+    glLoadIdentity()
+
+    glColor4f(0, 0, 0, 1)
+    glBegin(GL_QUADS)
+    glVertex2f(x1, y1); glVertex2f(x2, y1)
+    glVertex2f(x2, y2); glVertex2f(x1, y2)
+    glEnd()
+
+    glMatrixMode(GL_PROJECTION)
+    glPopMatrix()
+    glMatrixMode(GL_MODELVIEW)
+    glPopMatrix()
+
+    # Restore everything that was set before _draw_wipe() was called
+    glPopAttrib()
+
 '''
 init() function
 Sets up OpenX for use
 '''
-
 def init():
     global FBO, FBO_TEXTURE, FBO_RBO
     global GPU
 
     pygame.init()
 
-
-
     print("\n"*256)
-    print("This application is being emulated in OpenX v1.4")
-    print("www.mjwil116.codehs.me/openx.html")
+    print("This application is being emulated in OpenX v1.4.1")
+    print("https://github.com/AMWOnline/OpenX")
 
     try:
         pygame.mixer.init()
     except:
         print("Open-X [WARNING] >> Unable to load audio device!")
-
-    
-    try:
-        GPU = GPUtil.getGPUs()[0].name
-    except:
-        GPU = "No GPU"
-        print("Open-X [WARNING] >> No GPU is installed, or was detected!")
         
 
     win_w = RENDER_WIDTH  * WINDOW_SCALE
@@ -171,25 +243,84 @@ def init():
 
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
 
+    # Set up mosaic effect
+    global MOSAIC_FBO, MOSAIC_TEX
+
+    MOSAIC_FBO = glGenFramebuffers(1)
+    glBindFramebuffer(GL_FRAMEBUFFER, MOSAIC_FBO)
+
+    MOSAIC_TEX = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, MOSAIC_TEX)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
+                 RENDER_WIDTH, RENDER_HEIGHT,
+                 0, GL_RGB, GL_UNSIGNED_BYTE, None)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, MOSAIC_TEX, 0)
+
+    glBindFramebuffer(GL_FRAMEBUFFER, FBO)
+
+    # Set up dissolve effect
+    global DISSOLVE_MASK, DISSOLVE_PIXELS
+
+    DISSOLVE_MASK   = np.zeros((RENDER_HEIGHT, RENDER_WIDTH, 4), dtype=np.uint8)
+    total = RENDER_WIDTH * RENDER_HEIGHT
+    DISSOLVE_PIXELS = np.arange(total, dtype=np.int32)
+    np.random.shuffle(DISSOLVE_PIXELS)
 '''
 flip() function
 Refreshes the screen and advances to the next frame of video
 '''
 def flip():
+    global MOSAIC_LEVEL, MOSAIC_TARGET, MOSAIC_SPEED
+
     CLOCK.tick(60)
 
     win_w = RENDER_WIDTH  * WINDOW_SCALE
     win_h = RENDER_HEIGHT * WINDOW_SCALE
 
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, FBO)
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
-    glBlitFramebuffer(
-        0, 0, RENDER_WIDTH, RENDER_HEIGHT,
-        0, 0, win_w, win_h,
-        GL_COLOR_BUFFER_BIT, GL_NEAREST
-    )
+    # --- Apply all FX to FBO before blitting ---
+    if DISSOLVE_ACTIVE or (DISSOLVE_MASK is not None and DISSOLVE_MASK[:,:,3].any()):
+        _step_dissolve()
+        glBindFramebuffer(GL_FRAMEBUFFER, FBO)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glWindowPos2d(0, 0)
+        glDrawPixels(RENDER_WIDTH, RENDER_HEIGHT, GL_RGBA, GL_UNSIGNED_BYTE,
+                     DISSOLVE_MASK.tobytes())
+        glDisable(GL_BLEND)
+
+    _draw_wipe()
+
+    # --- Mosaic or plain blit to screen ---
+    if MOSAIC_LEVEL < MOSAIC_TARGET:
+        MOSAIC_LEVEL = min(MOSAIC_LEVEL + MOSAIC_SPEED, MOSAIC_TARGET)
+    elif MOSAIC_LEVEL > MOSAIC_TARGET:
+        MOSAIC_LEVEL = max(MOSAIC_LEVEL - MOSAIC_SPEED, MOSAIC_TARGET)
+
+    if MOSAIC_LEVEL <= 1.0:
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, FBO)
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
+        glBlitFramebuffer(
+            0, 0, RENDER_WIDTH, RENDER_HEIGHT,
+            0, 0, win_w, win_h,
+            GL_COLOR_BUFFER_BIT, GL_NEAREST
+        )
+    else:
+        mw = max(1, int(RENDER_WIDTH  / MOSAIC_LEVEL))
+        mh = max(1, int(RENDER_HEIGHT / MOSAIC_LEVEL))
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, FBO)
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MOSAIC_FBO)
+        glBlitFramebuffer(0, 0, RENDER_WIDTH, RENDER_HEIGHT, 0, 0, mw, mh,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, MOSAIC_FBO)
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0)
+        glBlitFramebuffer(0, 0, mw, mh, 0, 0, win_w, win_h,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST)
 
     pygame.display.flip()
+
     glBindFramebuffer(GL_FRAMEBUFFER, FBO)
     glViewport(0, 0, RENDER_WIDTH, RENDER_HEIGHT)
     glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
@@ -857,7 +988,7 @@ Handles drawing 2D Text over the screen, like a HUD
 
 class Font:
 
-    # Draw text with a solid background color (original behavior)
+    # Draw text with a solid background color
     def draw_rgba(x, y, font, text, color, bg_color, size):
         global FONT_CACHE
 
@@ -1220,6 +1351,92 @@ class Collision:
             glEnable(GL_LIGHTING)
             glEnable(GL_TEXTURE_2D)
             
+'''
+FX Class
+Adds new special effects
+'''
+class FX:
+    
+    # Gradually pixelate the screen.
+    # level = how blocky it gets (8 is subtle, 32 is very SNES, 64 is extreme)
+    # speed = how many levels it steps per frame
+    def pixelate(level=32, speed=1.0):
+        global MOSAIC_TARGET, MOSAIC_SPEED
+        MOSAIC_TARGET = max(1.0, float(level))
+        MOSAIC_SPEED  = speed
+
+    # Gradually return to full resolution
+    def depixelate(speed=1.0):
+        global MOSAIC_TARGET, MOSAIC_SPEED
+        MOSAIC_TARGET = 1.0
+        MOSAIC_SPEED  = speed
+
+    # Randomly black out pixels until the screen is black
+    # rate = pixels flipped per frame
+    def dissolve_out(rate=200, block_size=8):
+        global DISSOLVE_ACTIVE, DISSOLVE_MODE, DISSOLVE_RATE
+        global DISSOLVE_INDEX, DISSOLVE_MASK, DISSOLVE_QUEUE, DISSOLVE_BLOCK
+
+        DISSOLVE_MASK[:] = 0
+        DISSOLVE_BLOCK   = block_size
+        DISSOLVE_RATE    = rate
+        DISSOLVE_MODE    = 'out'
+        DISSOLVE_INDEX   = 0
+
+        # Build a list of every block position and shuffle it once
+        cols = np.arange(0, RENDER_WIDTH,  block_size)
+        rows = np.arange(0, RENDER_HEIGHT, block_size)
+        grid = np.array(np.meshgrid(rows, cols)).T.reshape(-1, 2)
+        np.random.shuffle(grid)
+        DISSOLVE_QUEUE  = grid
+        DISSOLVE_ACTIVE = True
+
+    # Randomly reveal pixels until the screen is fully visible
+    # rate = pixels revealed per frame
+    def dissolve_in(rate=200, block_size=8):
+        global DISSOLVE_ACTIVE, DISSOLVE_MODE, DISSOLVE_RATE
+        global DISSOLVE_INDEX, DISSOLVE_MASK, DISSOLVE_QUEUE, DISSOLVE_BLOCK
+
+        DISSOLVE_MASK[:, :, 0] = 0
+        DISSOLVE_MASK[:, :, 1] = 0
+        DISSOLVE_MASK[:, :, 2] = 0
+        DISSOLVE_MASK[:, :, 3] = 255
+        DISSOLVE_BLOCK   = block_size
+        DISSOLVE_RATE    = rate
+        DISSOLVE_MODE    = 'in'
+        DISSOLVE_INDEX   = 0
+
+        cols = np.arange(0, RENDER_WIDTH,  block_size)
+        rows = np.arange(0, RENDER_HEIGHT, block_size)
+        grid = np.array(np.meshgrid(rows, cols)).T.reshape(-1, 2)
+        np.random.shuffle(grid)
+        DISSOLVE_QUEUE  = grid
+        DISSOLVE_ACTIVE = True
+
+    # Changes the size of the pixels in the dissolve effect
+    def dissolve_size(block_size):
+        global DISSOLVE_SIZE
+        DISSOLVE_SIZE = block_size
+
+    # Sweep a black rectangle across the screen.
+    # direction: 'right', 'left', 'up', 'down'
+    # speed: progress per frame (0.02 = ~50 frames, 0.05 = ~20 frames)
+    def wipe_out(direction='right', speed=0.02):
+        global WIPE_PROGRESS, WIPE_TARGET, WIPE_SPEED, WIPE_DIRECTION, WIPE_ACTIVE
+        WIPE_PROGRESS  = 0.0
+        WIPE_TARGET    = 1.0
+        WIPE_SPEED     = speed
+        WIPE_DIRECTION = direction
+        WIPE_ACTIVE    = True
+
+    # Reveal the screen by sweeping the black rectangle away
+    def wipe_in(direction='right', speed=0.02):
+        global WIPE_PROGRESS, WIPE_TARGET, WIPE_SPEED, WIPE_DIRECTION, WIPE_ACTIVE
+        WIPE_PROGRESS  = 1.0
+        WIPE_TARGET    = 0.0
+        WIPE_SPEED     = speed
+        WIPE_DIRECTION = direction
+        WIPE_ACTIVE    = True
 
 '''
 Debug Class
@@ -1244,4 +1461,4 @@ def DEBUG_CODEHS_MODE():
     global RENDER_WIDTH, RENDER_HEIGHT, WINDOW_SCALE
     RENDER_WIDTH  = 320
     RENDER_HEIGHT = 240
-    WINDOW_SCALE  = 2
+    WINDOW_SCALE  = 3
