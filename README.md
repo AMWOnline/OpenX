@@ -1,7 +1,13 @@
 # OpenX
 OpenX is a 3D rendering engine for Python developed using PyGame and pyOpenGL. It is intended to make developing basic 3D scenes (with interactivity) using Python and OpenGL easier and more intutive. OpenX is useful for developing beginner 3D games from scratch, or developing primitve 3D rendering.
 
-## What's New in Version 1.4
+## What's New in Version 1.4.1 - "More FX" Update
+- Added new effects in a new "FX" class
+- Pixel mosaic effect with FX.pixelate() and FX.depixelate()
+- Dissolve screen effect with FX.dissolve_in() and FX.dissolve_out()
+- Wipe effect using FX.wipe_in() and FX.wipe_out()
+- Removed GPU name check
+### v1.4 Major Update Changelog
 - Tex2D.Billboard.draw() no longer re-uploads the billboard texture every time, adds it to a cache
 - Billboards can now support alpha channels
 - Billboards now use quad rendering, fixes un-accurate rendering with distance changes
@@ -25,12 +31,7 @@ OpenX is a 3D rendering engine for Python developed using PyGame and pyOpenGL. I
 - Larger textures can now be easily handled without tanking performance (tested up to 1024*1024 on PC)
 - Added more vertices to Sphere and Cylinder draw methods to make them look more realistic
 - Added new Debug class
-### What's New in Version 1.4.1
-- Added new effects in a new "FX" class
-- Pixel mosaic effect with FX.pixelate() and FX.depixelate()
-- Dissolve screen effect with FX.dissolve_in() and FX.dissolve_out()
-- Wipe effect using FX.wipe_in() and FX.wipe_out()
-- Removed GPU name check
+
 
 <img width="400" height="300" alt="Demo screenshot of a bouncing ball rendered with OpenX v1.3" src="https://github.com/user-attachments/assets/7cd3722b-6c54-4e71-9159-678607e2d0bb" />
 <img width="400" height="300" alt="A demo scene of the interior of a building" src="https://codehs.com/uploads/3b5226120571e86cc1769d76f0505dff">
