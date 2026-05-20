@@ -1358,7 +1358,7 @@ Adds new special effects
 class FX:
     
     # Gradually pixelate the screen.
-    # level = how blocky it gets (8 is subtle, 32 is very SNES, 64 is extreme)
+    # level = how blocky it gets
     # speed = how many levels it steps per frame
     def pixelate(level=32, speed=1.0):
         global MOSAIC_TARGET, MOSAIC_SPEED
